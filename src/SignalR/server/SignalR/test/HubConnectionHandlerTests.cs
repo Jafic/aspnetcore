@@ -19,10 +19,8 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Connections.Features;
-using Microsoft.AspNetCore.Internal;
 using Microsoft.AspNetCore.SignalR.Internal;
 using Microsoft.AspNetCore.SignalR.Protocol;
-using Microsoft.AspNetCore.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Testing;
@@ -946,6 +944,30 @@ namespace Microsoft.AspNetCore.SignalR.Tests
             }
 
             Assert.True(hasErrorLog);
+        }
+
+        [Fact]
+        public async Task HubMethodListeningToConnectionAbortedClosesOnConnectionContextAbort()
+        {
+            using (StartVerifiableLog())
+            {
+                var connectionHandler = HubConnectionHandlerTestUtils.GetHubConnectionHandler(typeof(MethodHub), loggerFactory: LoggerFactory);
+
+                using (var client = new TestClient())
+                {
+                    var connectionHandlerTask = await client.ConnectAsync(connectionHandler);
+
+                    var invokeTask = client.InvokeAsync(nameof(MethodHub.BlockingMethod));
+
+                    client.Connection.Abort();
+
+                    // If this completes then the server has completed the connection
+                    await connectionHandlerTask.OrTimeout();
+
+                    // Nothing written to connection because it was closed
+                    Assert.False(invokeTask.IsCompleted);
+                }
+            }
         }
 
         [Fact]
@@ -2232,7 +2254,7 @@ namespace Microsoft.AspNetCore.SignalR.Tests
             {
                 Assert.NotNull(context.Resource);
                 var resource = Assert.IsType<HubInvocationContext>(context.Resource);
-                Assert.Equal(typeof(MethodHub), resource.HubType);
+                Assert.Equal(typeof(MethodHub), resource.Hub.GetType());
                 Assert.Equal(nameof(MethodHub.MultiParamAuthMethod), resource.HubMethodName);
                 Assert.Equal(2, resource.HubMethodArguments?.Count);
                 Assert.Equal("Hello", resource.HubMethodArguments[0]);
@@ -2240,6 +2262,8 @@ namespace Microsoft.AspNetCore.SignalR.Tests
                 Assert.NotNull(resource.Context);
                 Assert.Equal(context.User, resource.Context.User);
                 Assert.NotNull(resource.Context.GetHttpContext());
+                Assert.NotNull(resource.ServiceProvider);
+                Assert.Equal(typeof(MethodHub).GetMethod(nameof(MethodHub.MultiParamAuthMethod)), resource.HubMethod);
 
                 return Task.CompletedTask;
             }
@@ -2782,7 +2806,6 @@ namespace Microsoft.AspNetCore.SignalR.Tests
         }
 
         [Fact]
-        [QuarantinedTest]
         public async Task ReceivingMessagesPreventsConnectionTimeoutFromOccuring()
         {
             using (StartVerifiableLog())
@@ -2822,13 +2845,13 @@ namespace Microsoft.AspNetCore.SignalR.Tests
         internal class PipeReaderWrapper : PipeReader
         {
             private readonly PipeReader _originalPipeReader;
-            private TaskCompletionSource<object> _waitForRead;
+            private TaskCompletionSource _waitForRead;
             private object _lock = new object();
 
             public PipeReaderWrapper(PipeReader pipeReader)
             {
                 _originalPipeReader = pipeReader;
-                _waitForRead = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _waitForRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             }
 
             public override void AdvanceTo(SequencePosition consumed) =>
@@ -2847,7 +2870,7 @@ namespace Microsoft.AspNetCore.SignalR.Tests
             {
                 lock (_lock)
                 {
-                    _waitForRead.SetResult(null);
+                    _waitForRead.SetResult();
                 }
 
                 try
@@ -2858,7 +2881,7 @@ namespace Microsoft.AspNetCore.SignalR.Tests
                 {
                     lock (_lock)
                     {
-                        _waitForRead = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        _waitForRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                     }
                 }
             }
@@ -3313,6 +3336,52 @@ namespace Microsoft.AspNetCore.SignalR.Tests
 
                     await client.SendInvocationAsync(nameof(MethodHub.ProtocolError)).OrTimeout();
                     await connectionHandlerTask.OrTimeout();
+                }
+            }
+        }
+
+        [Fact]
+        public async Task SerializationExceptionsSendSelfArePassedToOnDisconnectedAsync()
+        {
+            using (StartVerifiableLog(write => write.EventId.Name == "FailedWritingMessage"))
+            {
+                var state = new ConnectionLifetimeState();
+                var serviceProvider = HubConnectionHandlerTestUtils.CreateServiceProvider(s => s.AddSingleton(state), LoggerFactory);
+                var connectionHandler = serviceProvider.GetService<HubConnectionHandler<ConnectionLifetimeHub>>();
+
+                using (var client = new TestClient())
+                {
+                    var connectionHandlerTask = await client.ConnectAsync(connectionHandler);
+
+                    // Test HubConnectionContext.WriteCore(HubMessage) codepath
+                    await client.SendInvocationAsync(nameof(ConnectionLifetimeHub.ProtocolErrorSelf)).OrTimeout();
+
+                    await connectionHandlerTask.OrTimeout();
+
+                    Assert.IsType<System.Text.Json.JsonException>(state.DisconnectedException);
+                }
+            }
+        }
+
+        [Fact]
+        public async Task SerializationExceptionsSendAllArePassedToOnDisconnectedAsync()
+        {
+            using (StartVerifiableLog(write => write.EventId.Name == "FailedWritingMessage"))
+            {
+                var state = new ConnectionLifetimeState();
+                var serviceProvider = HubConnectionHandlerTestUtils.CreateServiceProvider(s => s.AddSingleton(state), LoggerFactory);
+                var connectionHandler = serviceProvider.GetService<HubConnectionHandler<ConnectionLifetimeHub>>();
+
+                using (var client = new TestClient())
+                {
+                    var connectionHandlerTask = await client.ConnectAsync(connectionHandler);
+
+                    // Test HubConnectionContext.WriteCore(SerializedHubMessage) codepath
+                    await client.SendInvocationAsync(nameof(ConnectionLifetimeHub.ProtocolErrorAll)).OrTimeout();
+
+                    await connectionHandlerTask.OrTimeout();
+
+                    Assert.IsType<System.Text.Json.JsonException>(state.DisconnectedException);
                 }
             }
         }
@@ -4010,8 +4079,8 @@ namespace Microsoft.AspNetCore.SignalR.Tests
         {
             public int ReleaseCount;
             private IServiceProvider _serviceProvider;
-            public TaskCompletionSource<object> ReleaseTask = new TaskCompletionSource<object>();
-            public TaskCompletionSource<object> CreateTask = new TaskCompletionSource<object>();
+            public TaskCompletionSource ReleaseTask = new TaskCompletionSource();
+            public TaskCompletionSource CreateTask = new TaskCompletionSource();
 
             public CustomHubActivator(IServiceProvider serviceProvider)
             {
@@ -4020,9 +4089,9 @@ namespace Microsoft.AspNetCore.SignalR.Tests
 
             public THub Create()
             {
-                ReleaseTask = new TaskCompletionSource<object>();
+                ReleaseTask = new TaskCompletionSource();
                 var hub = new DefaultHubActivator<THub>(_serviceProvider).Create();
-                CreateTask.TrySetResult(null);
+                CreateTask.TrySetResult();
                 return hub;
             }
 
@@ -4030,8 +4099,8 @@ namespace Microsoft.AspNetCore.SignalR.Tests
             {
                 ReleaseCount++;
                 hub.Dispose();
-                ReleaseTask.TrySetResult(null);
-                CreateTask = new TaskCompletionSource<object>();
+                ReleaseTask.TrySetResult();
+                CreateTask = new TaskCompletionSource();
             }
         }
 

@@ -6,6 +6,7 @@ using System.Buffers;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipelines;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Connections;
@@ -446,7 +447,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                             var flushTask = RequestBodyPipe.Writer.FlushAsync();
                             // It shouldn't be possible for the RequestBodyPipe to fill up an return an incomplete task if
                             // _inputFlowControl.Advance() didn't throw.
-                            Debug.Assert(flushTask.IsCompleted);
+                            Debug.Assert(flushTask.IsCompletedSuccessfully);
                         }
                     }
                 }
@@ -517,10 +518,11 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             ResetAndAbort(abortReason, Http2ErrorCode.INTERNAL_ERROR);
         }
 
-        protected override void ApplicationAbort()
+        protected override void ApplicationAbort() => ApplicationAbort(new ConnectionAbortedException(CoreStrings.ConnectionAbortedByApplication), Http2ErrorCode.INTERNAL_ERROR);
+
+        private void ApplicationAbort(ConnectionAbortedException abortReason, Http2ErrorCode error)
         {
-            var abortReason = new ConnectionAbortedException(CoreStrings.ConnectionAbortedByApplication);
-            ResetAndAbort(abortReason, Http2ErrorCode.INTERNAL_ERROR);
+            ResetAndAbort(abortReason, error);
         }
 
         internal void ResetAndAbort(ConnectionAbortedException abortReason, Http2ErrorCode error)
@@ -548,10 +550,10 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             // ensure that an app that completes early due to the abort doesn't result in header frames being sent.
             _http2Output.Stop();
 
-            AbortRequest();
+            CancelRequestAbortedToken();
 
             // Unblock the request body.
-            PoisonRequestBodyStream(abortReason);
+            PoisonBody(abortReason);
             RequestBodyPipe.Writer.Complete(abortReason);
 
             _inputFlowControl.Abort();
@@ -616,6 +618,25 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             RstStreamReceived = 1,
             EndStreamReceived = 2,
             Aborted = 4,
+        }
+
+        public override void OnHeader(int index, ReadOnlySpan<byte> name, ReadOnlySpan<byte> value)
+        {
+            base.OnHeader(index, name, value);
+
+            // HPack append will return false if the index is not a known request header.
+            // For example, someone could send the index of "Server" (a response header) in the request.
+            // If that happens then fallback to using Append with the name bytes.
+            if (!HttpRequestHeaders.TryHPackAppend(index, value))
+            {
+                AppendHeader(name, value);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void AppendHeader(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value)
+        {
+            HttpRequestHeaders.Append(name, value);
         }
     }
 }

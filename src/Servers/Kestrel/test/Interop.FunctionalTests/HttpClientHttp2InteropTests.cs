@@ -42,7 +42,7 @@ namespace Interop.FunctionalTests
                     new[] { "http" }
                 };
 
-                if (Utilities.CurrentPlatformSupportsAlpn())
+                if (Utilities.CurrentPlatformSupportsHTTP2OverTls())
                 {
                     list.Add(new[] { "https" });
                 }
@@ -696,6 +696,7 @@ namespace Interop.FunctionalTests
 
         [Theory]
         [MemberData(nameof(SupportedSchemes))]
+        [QuarantinedTest]
         public async Task ServerReset_BeforeRequestBody_ClientBodyThrows(string scheme)
         {
             var clientEcho = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1415,7 +1416,6 @@ namespace Interop.FunctionalTests
         // Settings_InitialWindowSize_Lower_Client - Not configurable.
 
         [Theory]
-        [QuarantinedTest]
         [MemberData(nameof(SupportedSchemes))]
         public async Task Settings_InitialWindowSize_Server(string scheme)
         {

@@ -39,7 +39,7 @@ namespace Microsoft.AspNetCore.Server.IIS.Core.IO
                 var read = GetReadOperation();
                 read.Initialize(_handler, memory);
                 read.Invoke();
-                return new ValueTask<int>(read, 0);   
+                return new ValueTask<int>(read, 0);
             }
         }
 
@@ -110,7 +110,7 @@ namespace Microsoft.AspNetCore.Server.IIS.Core.IO
             }
         }
 
-        public void Dispose()
+        public void Complete()
         {
             lock (_contextLock)
             {

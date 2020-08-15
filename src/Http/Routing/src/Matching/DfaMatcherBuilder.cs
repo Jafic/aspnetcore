@@ -1,6 +1,8 @@
 // Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
+#nullable disable
+
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -41,6 +43,15 @@ namespace Microsoft.AspNetCore.Routing.Matching
             _parameterPolicyFactory = parameterPolicyFactory;
             _selector = selector;
 
+            if (AppContext.TryGetSwitch("Microsoft.AspNetCore.Routing.UseCorrectCatchAllBehavior", out var enabled))
+            {
+                UseCorrectCatchAllBehavior = enabled;
+            }
+            else
+            {
+                UseCorrectCatchAllBehavior = false; // default to bugged behavior
+            }
+
             var (nodeBuilderPolicies, endpointComparerPolicies, endpointSelectorPolicies) = ExtractPolicies(policies.OrderBy(p => p.Order));
             _endpointSelectorPolicies = endpointSelectorPolicies;
             _nodeBuilders = nodeBuilderPolicies;
@@ -56,6 +67,9 @@ namespace Microsoft.AspNetCore.Routing.Matching
         // Used in tests
         internal EndpointComparer Comparer => _comparer;
 
+        // Used in tests
+        internal bool UseCorrectCatchAllBehavior { get; set; }
+
         public override void AddEndpoint(RouteEndpoint endpoint)
         {
             _endpoints.Add(endpoint);
@@ -63,6 +77,15 @@ namespace Microsoft.AspNetCore.Routing.Matching
 
         public DfaNode BuildDfaTree(bool includeLabel = false)
         {
+            if (!UseCorrectCatchAllBehavior)
+            {
+                // In 3.0 we did a global sort of the endpoints up front. This was a bug, because we actually want
+                // do do the sort at each level of the tree based on precedence.
+                //
+                // _useLegacy30Behavior enables opt-out via an AppContext switch.
+                _endpoints.Sort(_comparer);
+            }
+
             // Since we're doing a BFS we will process each 'level' of the tree in stages
             // this list will hold the set of items we need to process at the current
             // stage.
@@ -116,8 +139,13 @@ namespace Microsoft.AspNetCore.Routing.Matching
                     nextWork = previousWork;
                 }
 
-                // See comments on precedenceDigitComparer
-                work.Sort(0, workCount, precedenceDigitComparer);
+                if (UseCorrectCatchAllBehavior)
+                {
+                    // The fix for the 3.0 sorting behavior bug.
+
+                    // See comments on precedenceDigitComparer
+                    work.Sort(0, workCount, precedenceDigitComparer);
+                }
 
                 for (var i = 0; i < workCount; i++)
                 {
@@ -221,7 +249,9 @@ namespace Microsoft.AspNetCore.Routing.Matching
                                 }
                             }
 
-                            AddLiteralNode(includeLabel, nextParents, parent, requiredValue.ToString());
+                            var literalValue = requiredValue?.ToString() ?? throw new InvalidOperationException($"Required value for literal '{parameterPart.Name}' must evaluate to a non-null string.");
+
+                            AddLiteralNode(includeLabel, nextParents, parent, literalValue);
                         }
                         else if (segment.IsSimple && parameterPart != null)
                         {
@@ -327,7 +357,7 @@ namespace Microsoft.AspNetCore.Routing.Matching
             if (segment is null)
             {
                 // Treat "no segment" as high priority. it won't effect the algorithm, but we need to define a sort-order.
-                return 0; 
+                return 0;
             }
 
             return RoutePrecedence.ComputeInboundPrecedenceDigit(endpoint.RoutePattern, segment);
@@ -460,7 +490,10 @@ namespace Microsoft.AspNetCore.Routing.Matching
                 candidates,
                 endpointSelectorPolicies?.ToArray() ?? Array.Empty<IEndpointSelectorPolicy>(),
                 JumpTableBuilder.Build(currentDefaultDestination, currentExitDestination, pathEntries),
-                BuildPolicy(currentExitDestination, node.NodeBuilder, policyEntries));
+                // Use the final exit destination when building the policy state.
+                // We don't want to use either of the current destinations because they refer routing states,
+                // and a policy state should never transition back to a routing state.
+                BuildPolicy(exitDestination, node.NodeBuilder, policyEntries));
 
             return currentStateIndex;
 
@@ -712,7 +745,7 @@ namespace Microsoft.AspNetCore.Routing.Matching
             {
                 var nodeBuilder = _nodeBuilders[i];
 
-                // Build a list of each 
+                // Build a list of each
                 List<DfaNode> nextWork;
                 if (previousWork == null)
                 {

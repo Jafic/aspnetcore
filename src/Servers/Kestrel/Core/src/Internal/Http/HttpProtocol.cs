@@ -136,6 +136,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http
         public int LocalPort { get; set; }
         public string Scheme { get; set; }
         public HttpMethod Method { get; set; }
+        public string MethodText => ((IHttpRequestFeature)this).Method;
         public string PathBase { get; set; }
 
         public string Path { get; set; }
@@ -368,7 +369,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http
             ConnectionIdFeature = ConnectionId;
 
             HttpRequestHeaders.Reset();
-            HttpRequestHeaders.UseLatin1 = ServerOptions.Latin1RequestHeaders;
+            HttpRequestHeaders.EncodingSelector = ServerOptions.RequestHeaderEncodingSelector;
             HttpRequestHeaders.ReuseHeaderValues = !ServerOptions.DisableStringReuse;
             HttpResponseHeaders.Reset();
             RequestHeaders = HttpRequestHeaders;
@@ -444,7 +445,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http
 
         protected abstract bool TryParseRequest(ReadResult result, out bool endConnection);
 
-        private void CancelRequestAbortedToken()
+        private void CancelRequestAbortedTokenCallback()
         {
             try
             {
@@ -469,7 +470,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http
             }
         }
 
-        protected void AbortRequest()
+        protected void CancelRequestAbortedToken()
         {
             var shouldScheduleCancellation = false;
 
@@ -487,11 +488,11 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http
             if (shouldScheduleCancellation)
             {
                 // Potentially calling user code. CancelRequestAbortedToken logs any exceptions.
-                ServiceContext.Scheduler.Schedule(state => ((HttpProtocol)state).CancelRequestAbortedToken(), this);
+                ServiceContext.Scheduler.Schedule(state => ((HttpProtocol)state).CancelRequestAbortedTokenCallback(), this);
             }
         }
 
-        protected void PoisonRequestBodyStream(Exception abortReason)
+        protected void PoisonBody(Exception abortReason)
         {
             _bodyControl?.Abort(abortReason);
         }
@@ -512,27 +513,35 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http
 
         public virtual void OnHeader(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value)
         {
-            _requestHeadersParsed++;
-            if (_requestHeadersParsed > ServerOptions.Limits.MaxRequestHeaderCount)
-            {
-                KestrelBadHttpRequestException.Throw(RequestRejectionReason.TooManyHeaders);
-            }
+            IncrementRequestHeadersCount();
 
             HttpRequestHeaders.Append(name, value);
         }
 
+        public virtual void OnHeader(int index, ReadOnlySpan<byte> name, ReadOnlySpan<byte> value)
+        {
+            IncrementRequestHeadersCount();
+
+            // This method should be overriden in specific implementations and the base should be
+            // called to validate the header count.
+        }
+
         public void OnTrailer(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value)
         {
-            // Trailers still count towards the limit.
+            IncrementRequestHeadersCount();
+
+            string key = name.GetHeaderName();
+            var valueStr = value.GetRequestHeaderString(key, HttpRequestHeaders.EncodingSelector);
+            RequestTrailers.Append(key, valueStr);
+        }
+
+        private void IncrementRequestHeadersCount()
+        {
             _requestHeadersParsed++;
             if (_requestHeadersParsed > ServerOptions.Limits.MaxRequestHeaderCount)
             {
                 KestrelBadHttpRequestException.Throw(RequestRejectionReason.TooManyHeaders);
             }
-
-            string key = name.GetHeaderName();
-            var valueStr = value.GetRequestHeaderStringNonNullCharacters(ServerOptions.Latin1RequestHeaders);
-            RequestTrailers.Append(key, valueStr);
         }
 
         public void OnHeadersComplete()
